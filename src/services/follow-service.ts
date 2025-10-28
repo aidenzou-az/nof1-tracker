@@ -42,7 +42,8 @@ export class FollowService {
     private orderHistoryManager: OrderHistoryManager,
     private riskManager: RiskManager,
     private capitalManager: FuturesCapitalManager,
-    private tradingExecutor: TradingExecutor
+    private tradingExecutor: TradingExecutor,
+    private tradingEnabled: boolean = true
   ) {}
 
   /**
@@ -126,7 +127,11 @@ export class FollowService {
     this.orderHistoryManager.reloadHistory();
 
     // 1. 清理孤立的挂单 (没有对应仓位的止盈止损单)
-    await this.positionManager.cleanOrphanedOrders();
+    if (this.tradingEnabled) {
+      await this.positionManager.cleanOrphanedOrders();
+    } else {
+      logDebug(`${LOGGING_CONFIG.EMOJIS.INFO} Trading disabled: skipping orphaned order cleanup`);
+    }
 
     // 1. 每次都从订单历史重建上次仓位状态
     // order-history.json 是唯一的真实来源，确保程序重启或 API 数据不变时都能正确检测变化
@@ -346,28 +351,32 @@ export class FollowService {
     let hasActualPosition = false;
     let releasedMargin: number | undefined;
     
-    try {
-      const binancePositions = await this.positionManager['binanceService'].getPositions();
-      const targetSymbol = this.positionManager['binanceService'].convertSymbol(currentPosition.symbol);
-      
-      const existingPosition = binancePositions.find(
-        p => p.symbol === targetSymbol && parseFloat(p.positionAmt) !== 0
-      );
-      
-      hasActualPosition = !!existingPosition;
-      
-      if (existingPosition) {
-        const positionAmt = parseFloat(existingPosition.positionAmt);
-        logDebug(`${LOGGING_CONFIG.EMOJIS.INFO} Found existing position on Binance: ${existingPosition.symbol} ${positionAmt > 0 ? 'LONG' : 'SHORT'} ${Math.abs(positionAmt)}`);
-      } else {
-        logDebug(`${LOGGING_CONFIG.EMOJIS.INFO} No existing position found on Binance for ${targetSymbol}`);
+    if (this.tradingEnabled) {
+      try {
+        const binancePositions = await this.positionManager['binanceService'].getPositions();
+        const targetSymbol = this.positionManager['binanceService'].convertSymbol(currentPosition.symbol);
+        
+        const existingPosition = binancePositions.find(
+          p => p.symbol === targetSymbol && parseFloat(p.positionAmt) !== 0
+        );
+        
+        hasActualPosition = !!existingPosition;
+        
+        if (existingPosition) {
+          const positionAmt = parseFloat(existingPosition.positionAmt);
+          logDebug(`${LOGGING_CONFIG.EMOJIS.INFO} Found existing position on Binance: ${existingPosition.symbol} ${positionAmt > 0 ? 'LONG' : 'SHORT'} ${Math.abs(positionAmt)}`);
+        } else {
+          logDebug(`${LOGGING_CONFIG.EMOJIS.INFO} No existing position found on Binance for ${targetSymbol}`);
+        }
+      } catch (error) {
+        console.warn(`${LOGGING_CONFIG.EMOJIS.WARNING} Failed to check existing positions: ${error instanceof Error ? error.message : 'Unknown error'}`);
       }
-    } catch (error) {
-      console.warn(`${LOGGING_CONFIG.EMOJIS.WARNING} Failed to check existing positions: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } else {
+      logDebug(`${LOGGING_CONFIG.EMOJIS.INFO} Trading disabled: skipping Binance position check for entry change`);
     }
 
     // 只有在真的有仓位时才执行平仓操作
-    if (hasActualPosition) {
+    if (this.tradingEnabled && hasActualPosition) {
       // 1. 平仓前获取账户余额
       let balanceBeforeClose: number | undefined;
       try {
@@ -474,64 +483,68 @@ export class FollowService {
 
     // 检查 Binance 是否已有该币种的仓位(防止程序重启后无法检测到 entry_oid 变化)
     let releasedMargin: number | undefined;
-    try {
-      const binancePositions = await this.positionManager['binanceService'].getPositions();
-      const targetSymbol = this.positionManager['binanceService'].convertSymbol(currentPosition.symbol);
-      
-      logDebug(`${LOGGING_CONFIG.EMOJIS.SEARCH} Checking for existing positions on Binance for ${currentPosition.symbol} (converted: ${targetSymbol})...`);
-      logVerbose(`${LOGGING_CONFIG.EMOJIS.DATA} Found ${binancePositions.length} total position(s) on Binance`);
-      
-      const existingPosition = binancePositions.find(
-        p => p.symbol === targetSymbol && parseFloat(p.positionAmt) !== 0
-      );
+    if (this.tradingEnabled) {
+      try {
+        const binancePositions = await this.positionManager['binanceService'].getPositions();
+        const targetSymbol = this.positionManager['binanceService'].convertSymbol(currentPosition.symbol);
+        
+        logDebug(`${LOGGING_CONFIG.EMOJIS.SEARCH} Checking for existing positions on Binance for ${currentPosition.symbol} (converted: ${targetSymbol})...`);
+        logVerbose(`${LOGGING_CONFIG.EMOJIS.DATA} Found ${binancePositions.length} total position(s) on Binance`);
+        
+        const existingPosition = binancePositions.find(
+          p => p.symbol === targetSymbol && parseFloat(p.positionAmt) !== 0
+        );
 
-      if (existingPosition) {
-        const positionAmt = parseFloat(existingPosition.positionAmt);
-        logInfo(`${LOGGING_CONFIG.EMOJIS.WARNING} Found existing position on Binance: ${existingPosition.symbol} ${positionAmt > 0 ? 'LONG' : 'SHORT'} ${Math.abs(positionAmt)}`);
-        logInfo(`${LOGGING_CONFIG.EMOJIS.INFO} Closing existing position before opening new entry (OID: ${currentPosition.entry_oid})...`);
-        
-        // 获取平仓前余额
-        let balanceBeforeClose: number | undefined;
-        try {
-          const accountInfo = await this.tradingExecutor.getAccountInfo();
-          balanceBeforeClose = parseFloat(accountInfo.availableBalance);
-          logDebug(`${LOGGING_CONFIG.EMOJIS.INFO} Balance before closing: $${balanceBeforeClose.toFixed(2)} USDT`);
-        } catch (error) {
-          logWarn(`${LOGGING_CONFIG.EMOJIS.WARNING} Failed to get balance before close: ${error instanceof Error ? error.message : 'Unknown error'}`);
-        }
-        
-        const closeReason = `Closing existing position before opening new entry (OID: ${currentPosition.entry_oid})`;
-        const closeResult = await this.positionManager.closePosition(currentPosition.symbol, closeReason);
-        
-        if (!closeResult.success) {
-          logError(`${LOGGING_CONFIG.EMOJIS.ERROR} Failed to close existing position for ${currentPosition.symbol}, skipping new position`);
-          return;
-        }
-        
-        // 获取平仓后余额,计算释放的资金
-        if (balanceBeforeClose !== undefined) {
+        if (existingPosition) {
+          const positionAmt = parseFloat(existingPosition.positionAmt);
+          logInfo(`${LOGGING_CONFIG.EMOJIS.WARNING} Found existing position on Binance: ${existingPosition.symbol} ${positionAmt > 0 ? 'LONG' : 'SHORT'} ${Math.abs(positionAmt)}`);
+          logInfo(`${LOGGING_CONFIG.EMOJIS.INFO} Closing existing position before opening new entry (OID: ${currentPosition.entry_oid})...`);
+          
+          // 获取平仓前余额
+          let balanceBeforeClose: number | undefined;
           try {
-            // 额外等待1秒确保资金完全释放
-            await new Promise(resolve => setTimeout(resolve, 1000));
             const accountInfo = await this.tradingExecutor.getAccountInfo();
-            const balanceAfterClose = parseFloat(accountInfo.availableBalance);
-            releasedMargin = balanceAfterClose - balanceBeforeClose;
-            logDebug(`${LOGGING_CONFIG.EMOJIS.INFO} Balance after closing: $${balanceAfterClose.toFixed(2)} USDT`);
-            logInfo(`${LOGGING_CONFIG.EMOJIS.MONEY} Released margin from closing: $${releasedMargin.toFixed(2)} USDT (${releasedMargin >= 0 ? 'Profit' : 'Loss'})`);
-            
-            if (releasedMargin <= 0) {
-              logWarn(`${LOGGING_CONFIG.EMOJIS.WARNING} Position closed with loss, insufficient margin released. Will use available balance.`);
-              releasedMargin = undefined;
-            }
+            balanceBeforeClose = parseFloat(accountInfo.availableBalance);
+            logDebug(`${LOGGING_CONFIG.EMOJIS.INFO} Balance before closing: $${balanceBeforeClose.toFixed(2)} USDT`);
           } catch (error) {
-            logWarn(`${LOGGING_CONFIG.EMOJIS.WARNING} Failed to get balance after close: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            logWarn(`${LOGGING_CONFIG.EMOJIS.WARNING} Failed to get balance before close: ${error instanceof Error ? error.message : 'Unknown error'}`);
           }
+          
+          const closeReason = `Closing existing position before opening new entry (OID: ${currentPosition.entry_oid})`;
+          const closeResult = await this.positionManager.closePosition(currentPosition.symbol, closeReason);
+          
+          if (!closeResult.success) {
+            logError(`${LOGGING_CONFIG.EMOJIS.ERROR} Failed to close existing position for ${currentPosition.symbol}, skipping new position`);
+            return;
+          }
+          
+          // 获取平仓后余额,计算释放的资金
+          if (balanceBeforeClose !== undefined) {
+            try {
+              // 额外等待1秒确保资金完全释放
+              await new Promise(resolve => setTimeout(resolve, 1000));
+              const accountInfo = await this.tradingExecutor.getAccountInfo();
+              const balanceAfterClose = parseFloat(accountInfo.availableBalance);
+              releasedMargin = balanceAfterClose - balanceBeforeClose;
+              logDebug(`${LOGGING_CONFIG.EMOJIS.INFO} Balance after closing: $${balanceAfterClose.toFixed(2)} USDT`);
+              logInfo(`${LOGGING_CONFIG.EMOJIS.MONEY} Released margin from closing: $${releasedMargin.toFixed(2)} USDT (${releasedMargin >= 0 ? 'Profit' : 'Loss'})`);
+              
+              if (releasedMargin <= 0) {
+                logWarn(`${LOGGING_CONFIG.EMOJIS.WARNING} Position closed with loss, insufficient margin released. Will use available balance.`);
+                releasedMargin = undefined;
+              }
+            } catch (error) {
+              logWarn(`${LOGGING_CONFIG.EMOJIS.WARNING} Failed to get balance after close: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            }
+          }
+        } else {
+          logDebug(`${LOGGING_CONFIG.EMOJIS.SUCCESS} No existing position found on Binance for ${targetSymbol}, proceeding with new position`);
         }
-      } else {
-        logDebug(`${LOGGING_CONFIG.EMOJIS.SUCCESS} No existing position found on Binance for ${targetSymbol}, proceeding with new position`);
+      } catch (error) {
+        logWarn(`${LOGGING_CONFIG.EMOJIS.WARNING} Failed to check existing positions: ${error instanceof Error ? error.message : 'Unknown error'}`);
       }
-    } catch (error) {
-      logWarn(`${LOGGING_CONFIG.EMOJIS.WARNING} Failed to check existing positions: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } else {
+      logDebug(`${LOGGING_CONFIG.EMOJIS.INFO} Trading disabled: skipping Binance position check for new position`);
     }
 
     // 添加价格容忍度检查
@@ -614,6 +627,26 @@ export class FollowService {
     if (!currentPosition || profitPercentage === undefined) return;
 
     logInfo(`${LOGGING_CONFIG.EMOJIS.MONEY} PROFIT TARGET REACHED: ${currentPosition.symbol} - Closing position at ${profitPercentage.toFixed(2)}% profit`);
+
+    if (!this.tradingEnabled) {
+      const followPlan: FollowPlan = {
+        action: "EXIT",
+        symbol: currentPosition.symbol,
+        side: currentPosition.quantity > 0 ? "SELL" : "BUY",
+        type: "MARKET",
+        quantity: Math.abs(currentPosition.quantity),
+        leverage: currentPosition.leverage,
+        exitPrice: currentPosition.current_price,
+        reason: `Profit target ${profitPercentage.toFixed(2)}% reached (analysis mode)`,
+        agent: agentId,
+        timestamp: Date.now(),
+        marginType: options?.marginType
+      };
+
+      plans.push(followPlan);
+      logInfo(`${LOGGING_CONFIG.EMOJIS.INFO} Trading disabled: generated exit plan for profit target without executing trade`);
+      return;
+    }
 
     // 直接执行平仓操作
     try {
@@ -711,12 +744,16 @@ export class FollowService {
 
     // 获取可用余额
     let availableBalance: number | undefined;
-    try {
-      const accountInfo = await this.tradingExecutor.getAccountInfo();
-      availableBalance = parseFloat(accountInfo.availableBalance);
-      logDebug(`${LOGGING_CONFIG.EMOJIS.INFO} Available account balance: ${availableBalance.toFixed(2)} USDT`);
-    } catch (balanceError) {
-      logWarn(`${LOGGING_CONFIG.EMOJIS.WARNING} Failed to get account balance: ${balanceError instanceof Error ? balanceError.message : 'Unknown error'}`);
+    if (this.tradingEnabled) {
+      try {
+        const accountInfo = await this.tradingExecutor.getAccountInfo();
+        availableBalance = parseFloat(accountInfo.availableBalance);
+        logDebug(`${LOGGING_CONFIG.EMOJIS.INFO} Available account balance: ${availableBalance.toFixed(2)} USDT`);
+      } catch (balanceError) {
+        logWarn(`${LOGGING_CONFIG.EMOJIS.WARNING} Failed to get account balance: ${balanceError instanceof Error ? balanceError.message : 'Unknown error'}`);
+      }
+    } else {
+      logDebug(`${LOGGING_CONFIG.EMOJIS.INFO} Trading disabled: skipping account balance fetch; allocating using provided margin only`);
     }
 
     // 执行资金分配

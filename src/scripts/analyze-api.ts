@@ -37,6 +37,10 @@ export type {
   FollowOptions
 } from "../types/api";
 
+interface ApiAnalyzerOptions {
+  tradingEnabled?: boolean;
+}
+
 export class ApiAnalyzer {
   private apiClient: ApiClient;
   private positionManager: PositionManager;
@@ -45,11 +49,15 @@ export class ApiAnalyzer {
   private binanceService: BinanceService;
   private tradingExecutor: TradingExecutor;
   private orderHistoryManager: OrderHistoryManager;
+  private tradingEnabled: boolean;
 
   constructor(
     baseUrlOrConfigManager?: string | ConfigManager,
-    apiClient?: ApiClient
+    apiClient?: ApiClient,
+    options?: ApiAnalyzerOptions
   ) {
+    this.tradingEnabled = options?.tradingEnabled ?? true;
+
     // 支持向后兼容的构造函数签名
     if (typeof baseUrlOrConfigManager === 'string') {
       // 旧的签名：baseUrl 作为字符串
@@ -85,7 +93,8 @@ export class ApiAnalyzer {
       this.orderHistoryManager,
       riskManager,
       capitalManager,
-      this.tradingExecutor
+      this.tradingExecutor,
+      this.tradingEnabled
     );
 
     this.apiClient = apiClient || new ApiClient();
@@ -99,7 +108,7 @@ export class ApiAnalyzer {
    */
   private validateEnvironment(): void {
     // 在测试环境中跳过环境变量验证
-    if (process.env.NODE_ENV === 'test') {
+    if (process.env.NODE_ENV === 'test' || !this.tradingEnabled) {
       return;
     }
 
@@ -229,6 +238,13 @@ export class ApiAnalyzer {
    */
   getOrderHistoryManager(): OrderHistoryManager {
     return this.orderHistoryManager;
+  }
+
+  /**
+   * 当前是否启用了交易执行能力
+   */
+  isTradingEnabled(): boolean {
+    return this.tradingEnabled;
   }
 
   /**

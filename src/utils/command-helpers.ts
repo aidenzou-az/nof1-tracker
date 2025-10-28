@@ -11,7 +11,14 @@ import * as path from 'path';
  * 初始化服务容器
  */
 export function initializeServices(includeOrderHistory = false): ServiceContainer {
-  const analyzer = new ApiAnalyzer();
+  const hasBinanceCredentials = Boolean(
+    process.env.BINANCE_API_KEY && process.env.BINANCE_API_SECRET
+  );
+
+  const analyzer = new ApiAnalyzer(undefined, undefined, {
+    tradingEnabled: hasBinanceCredentials
+  });
+
   return {
     analyzer,
     executor: new TradingExecutor(),

@@ -61,6 +61,15 @@ export async function handleFollowCommand(agentName: string, options: CommandOpt
   const services = initializeServices(true);
   applyConfiguration(services.analyzer, options);
 
+  if (!services.analyzer.isTradingEnabled()) {
+    if (!options.riskOnly) {
+      console.log('⚠️ Binance credentials not detected. For safety, running in analysis mode (equivalent to --risk-only). No trades will be executed.');
+      options.riskOnly = true;
+    } else {
+      console.log('ℹ️ Binance credentials not detected. Operating in analysis mode (no real trade execution).');
+    }
+  }
+
   console.log(`🤖 Starting to follow agent: ${agentName}`);
 
   if (options.interval) {
