@@ -100,7 +100,7 @@ npm run dev -- watch --agents deepseek-chat-v3.1 --interval 90 --guards-config .
 
 - `simulator`：默认执行器，只打印模拟执行结果。
 - `binance`：需要 `BINANCE_API_KEY/BINANCE_API_SECRET`（可选 `BINANCE_TESTNET=true` 指向测试网）。会在下单前拉取账户余额、持仓与最新价格；自动根据现有仓位决定是否开启 `reduceOnly`/`closePosition`；对新开仓做保证金校验；根据信号里的 `exit_plan` 自动挂出 `TAKE_PROFIT_MARKET` 和 `STOP_MARKET` 保护单。
-- `okx`：需要 `OKX_API_KEY/OKX_API_SECRET/OKX_API_PASS`（可选 `OKX_SIMULATED=true` 启用纸币交易）。会查询合约元信息、校准张数；在 `net` 与 `long_short` 模式下自动识别平仓/反手需求并设置 `reduceOnly`；按照账户可用资金校验保证金；若信号带有止盈止损，则会通过 `order-algo` 创建一笔联合 TP/SL 保护单。
+- `okx`：需要 `OKX_API_KEY/OKX_API_SECRET/OKX_API_PASS`（可选 `OKX_SIMULATED=true` 启用纸币交易）。底层基于官方维护的 [`okx-api`](https://www.npmjs.com/package/okx-api) SDK，与官方 REST API 同步更新。执行时会查询合约元信息、校准张数；在 `net` 与 `long_short` 模式下自动识别平仓/反手需求并设置 `reduceOnly`；按照账户可用资金校验保证金；若信号带有止盈止损，则会通过 `order-algo` 创建一笔联合 TP/SL 保护单。
 
 环境变量（Binance）：
 
