@@ -44,11 +44,24 @@ interface RawSignalPosition {
   exit_plan?: ExitPlan;
 }
 
-interface PositionState {
-  sameSideContracts: number;
-  oppositeContracts: number;
-  entryPosSide?: "long" | "short";
-  closePosSide?: "long" | "short";
+type OrderSide = "buy" | "sell";
+
+interface PreparedOrder {
+  side: OrderSide;
+  quantity: number;
+  reduceOnly: boolean;
+  posSide?: "long" | "short";
+}
+
+interface ExecutionContext {
+  decision: Decision;
+  instId: string;
+  instrument: OkxInstrumentMeta;
+  leverage: number;
+  balanceInfo: BalanceInfo;
+  marketPrice: number;
+  positions: PositionInfo[];
+  client: OkxHttpClient;
 }
 
 export class OkxExecutor implements ExchangeExecutor {
@@ -88,97 +101,35 @@ export class OkxExecutor implements ExchangeExecutor {
       const { balanceInfo, marketPrice, positions } = await this.collectAccountSnapshot(instId);
       logAccountSnapshot(balanceInfo, marketPrice, positions);
 
-      const positionState = analyzePositions(positions, decision.signal.side);
-      const ctVal = instrument.ctVal || 1;
-      const closableQuantity = positionState.oppositeContracts * ctVal;
-
-      let desiredQuantity = decision.signal.quantity;
-      let reduceOnly =
-        FORCE_REDUCE_ONLY || decision.reasonCode.includes("EXIT") || closableQuantity > 0;
-      let targetPosSide =
-        POS_MODE === "long_short"
-          ? reduceOnly && closableQuantity > 0
-            ? positionState.closePosSide
-            : positionState.entryPosSide
-          : undefined;
-
-      if (closableQuantity > 0 && desiredQuantity >= closableQuantity) {
-        desiredQuantity = closableQuantity;
-      }
-
-      if (desiredQuantity <= 0) {
-        return {
-          decisionId: decision.id,
-          success: false,
-          message: "Calculated order quantity is zero after adjustments."
-        };
-      }
-
-      const quantityCheck = verifyQuantity(desiredQuantity, instrument, marketPrice);
-      const adjustedQuantity = quantityCheck.adjustedQuantity;
-      const notional = adjustedQuantity * marketPrice;
-
       const leverageCandidate =
         DEFAULT_LEVERAGE ??
         decision.signal.leverage ??
         (positions.find((pos) => pos.pos !== 0)?.leverage || undefined);
       const leverage = leverageCandidate && leverageCandidate > 0 ? leverageCandidate : 1;
-      const requiredMargin = notional / leverage;
 
-      if (!reduceOnly && balanceInfo.available < requiredMargin) {
-        return {
-          decisionId: decision.id,
-          success: false,
-          message: `Insufficient balance: required ${requiredMargin.toFixed(
-            2
-          )}, available ${balanceInfo.available.toFixed(2)} ${balanceInfo.currency}`
-        };
+      if (POS_MODE === "long_short") {
+        return await this.executeInLongShortMode({
+          decision,
+          instId,
+          instrument,
+          leverage,
+          balanceInfo,
+          marketPrice,
+          positions,
+          client: this.client
+        });
       }
 
-      console.log("📊 Order context (OKX):");
-      console.log(`   Instrument: ${instId}`);
-      console.log(`   Side: ${decision.signal.side}`);
-      console.log(`   Contracts: ${quantityCheck.contracts}`);
-      console.log(`   Quantity: ${adjustedQuantity}`);
-      console.log(`   Market price: ${marketPrice.toFixed(2)} ${balanceInfo.currency}`);
-      console.log(`   Notional: ${notional.toFixed(2)} ${balanceInfo.currency}`);
-      console.log(`   Leverage: ${leverage}x`);
-      console.log(`   Reduce only: ${reduceOnly}`);
-
-      await this.configureLeverage(instId, leverage, targetPosSide);
-
-      const orderParams = buildOrderParams({
-        instId,
-        contracts: quantityCheck.contracts,
-        side: decision.signal.side === "LONG" ? "buy" : "sell",
-        reduceOnly,
-        posSide: targetPosSide
-      });
-
-      const response = await this.client.placeOrder(orderParams);
-
-      if (response.sCode && response.sCode !== "0") {
-        throw new Error(`OKX error ${response.sCode}: ${response.sMsg}`);
-      }
-
-      const stops = await this.setupStops(
+      return await this.executeInNetMode({
         decision,
         instId,
-        quantityCheck.contracts,
-        reduceOnly,
-        positionState.entryPosSide
-      );
-
-      const messageParts = [`ordId=${response.ordId ?? "unknown"}`];
-      if (stops.algoId) {
-        messageParts.push(`tpslAlgo=${stops.algoId}`);
-      }
-
-      return {
-        decisionId: decision.id,
-        success: true,
-        message: `Order placed (${messageParts.join(", ")})`
-      };
+        instrument,
+        leverage,
+        balanceInfo,
+        marketPrice,
+        positions,
+        client: this.client
+      });
     } catch (error) {
       return {
         decisionId: decision.id,
@@ -188,6 +139,306 @@ export class OkxExecutor implements ExchangeExecutor {
     }
   }
 
+  private async executeInNetMode(context: ExecutionContext): Promise<ExecutionReport> {
+    const {
+      decision,
+      instId,
+      instrument,
+      leverage,
+      balanceInfo,
+      marketPrice,
+      positions,
+      client
+    } = context;
+    const ctVal = instrument.ctVal || 1;
+    const targetContractsRaw = decision.signal.quantity / ctVal;
+    const targetContractsSigned =
+      (decision.signal.side === "LONG" ? 1 : -1) * targetContractsRaw;
+    const currentNetContracts = positions.reduce((sum, pos) => sum + pos.pos, 0);
+    const deltaContracts = targetContractsSigned - currentNetContracts;
+
+    if (Math.abs(deltaContracts) < 1e-8) {
+      return {
+        decisionId: decision.id,
+        success: true,
+        message: "Position already aligned with signal."
+      };
+    }
+
+    const orderSide: OrderSide = deltaContracts > 0 ? "buy" : "sell";
+    const desiredQuantity = Math.abs(deltaContracts) * ctVal;
+    const pureReduction = isPureReduction(currentNetContracts, targetContractsSigned);
+    if (FORCE_REDUCE_ONLY && !pureReduction) {
+      return {
+        decisionId: decision.id,
+        success: false,
+        message: "FORCE_REDUCE_ONLY is enabled; refusing to increase exposure."
+      };
+    }
+
+    const reduceOnly = FORCE_REDUCE_ONLY || pureReduction;
+    const rounding = reduceOnly ? "down" : "up";
+
+    const quantityCheck = verifyQuantity(desiredQuantity, instrument, marketPrice, {
+      rounding
+    });
+
+    if (quantityCheck.contracts <= 0) {
+      return {
+        decisionId: decision.id,
+        success: false,
+        message: "Order size below instrument minimum."
+      };
+    }
+
+    const notional = quantityCheck.adjustedQuantity * marketPrice;
+    const requiredMargin = notional / leverage;
+
+    if (!reduceOnly && balanceInfo.available < requiredMargin) {
+      return {
+        decisionId: decision.id,
+        success: false,
+        message: `Insufficient balance: required ${requiredMargin.toFixed(
+          2
+        )}, available ${balanceInfo.available.toFixed(2)} ${balanceInfo.currency}`
+      };
+    }
+
+    console.log("📊 Order context (OKX):");
+    console.log(`   Instrument: ${instId}`);
+    console.log(`   Side: ${orderSide} (net)`);
+    console.log(`   Contracts: ${quantityCheck.contracts}`);
+    console.log(`   Quantity: ${quantityCheck.adjustedQuantity}`);
+    console.log(`   Market price: ${marketPrice.toFixed(2)} ${balanceInfo.currency}`);
+    console.log(`   Notional: ${notional.toFixed(2)} ${balanceInfo.currency}`);
+    console.log(`   Leverage: ${leverage}x`);
+    console.log(`   Reduce only: ${reduceOnly}`);
+
+    await this.configureLeverage(instId, leverage);
+
+    const orderParams = buildOrderParams({
+      instId,
+      contracts: quantityCheck.contracts,
+      side: orderSide,
+      reduceOnly
+    });
+
+    const response = await client.placeOrder(orderParams);
+
+    if (response.sCode && response.sCode !== "0") {
+      throw new Error(`OKX error ${response.sCode}: ${response.sMsg}`);
+    }
+
+    const stopContracts = verifyQuantity(decision.signal.quantity, instrument, marketPrice, {
+      rounding: "down",
+      silent: true
+    }).contracts;
+
+    const shouldPlaceStops = !reduceOnly && stopContracts > 0;
+    const stops = shouldPlaceStops
+      ? await this.setupStops(decision, instId, stopContracts, false)
+      : {};
+
+    const messageParts = [`ordId=${response.ordId ?? "unknown"}`];
+    if (stops.algoId) {
+      messageParts.push(`tpslAlgo=${stops.algoId}`);
+    }
+
+    return {
+      decisionId: decision.id,
+      success: true,
+      message: `Order placed (${messageParts.join(", ")})`
+    };
+  }
+
+  private async executeInLongShortMode(context: ExecutionContext): Promise<ExecutionReport> {
+    const {
+      decision,
+      instId,
+      instrument,
+      leverage,
+      balanceInfo,
+      marketPrice,
+      positions,
+      client
+    } = context;
+    const ctVal = instrument.ctVal || 1;
+    const targetContracts = decision.signal.quantity / ctVal;
+    const { longContracts, shortContracts } = extractLongShortContracts(positions);
+    const orders: PreparedOrder[] = [];
+
+    if (decision.signal.side === "LONG") {
+      if (shortContracts > 0) {
+        orders.push({
+          side: "buy",
+          quantity: shortContracts * ctVal,
+          reduceOnly: true,
+          posSide: "short"
+        });
+      }
+
+      const deltaLong = targetContracts - longContracts;
+      if (Math.abs(deltaLong) > 1e-8) {
+        if (deltaLong > 0 && FORCE_REDUCE_ONLY) {
+          return {
+            decisionId: decision.id,
+            success: false,
+            message: "FORCE_REDUCE_ONLY is enabled; refusing to increase long exposure."
+          };
+        }
+
+        orders.push({
+          side: deltaLong > 0 ? "buy" : "sell",
+          quantity: Math.abs(deltaLong) * ctVal,
+          reduceOnly: deltaLong < 0 || FORCE_REDUCE_ONLY,
+          posSide: "long"
+        });
+      }
+    } else {
+      if (longContracts > 0) {
+        orders.push({
+          side: "sell",
+          quantity: longContracts * ctVal,
+          reduceOnly: true,
+          posSide: "long"
+        });
+      }
+
+      const deltaShort = targetContracts - shortContracts;
+      if (Math.abs(deltaShort) > 1e-8) {
+        if (deltaShort > 0 && FORCE_REDUCE_ONLY) {
+          return {
+            decisionId: decision.id,
+            success: false,
+            message: "FORCE_REDUCE_ONLY is enabled; refusing to increase short exposure."
+          };
+        }
+
+        orders.push({
+          side: deltaShort > 0 ? "sell" : "buy",
+          quantity: Math.abs(deltaShort) * ctVal,
+          reduceOnly: deltaShort < 0 || FORCE_REDUCE_ONLY,
+          posSide: "short"
+        });
+      }
+    }
+
+    if (orders.length === 0) {
+      return {
+        decisionId: decision.id,
+        success: true,
+        message: "Position already aligned with signal."
+      };
+    }
+
+    let available = balanceInfo.available;
+    const messageParts: string[] = [];
+
+    for (const order of orders) {
+      if (order.quantity <= 0) {
+        continue;
+      }
+
+      const rounding = order.reduceOnly ? "down" : "up";
+      const quantityCheck = verifyQuantity(order.quantity, instrument, marketPrice, {
+        rounding
+      });
+
+      if (quantityCheck.contracts <= 0) {
+        if (order.reduceOnly) {
+          console.warn(
+            `⚠️ Skipping ${order.posSide ?? "net"} reduce-only order; quantity below instrument minimum.`
+          );
+          continue;
+        }
+        return {
+          decisionId: decision.id,
+          success: false,
+          message: "Order size below instrument minimum."
+        };
+      }
+
+      const notional = quantityCheck.adjustedQuantity * marketPrice;
+      const requiredMargin = notional / leverage;
+
+      if (!order.reduceOnly && available < requiredMargin) {
+        return {
+          decisionId: decision.id,
+          success: false,
+          message: `Insufficient balance: required ${requiredMargin.toFixed(
+            2
+          )}, available ${available.toFixed(2)} ${balanceInfo.currency}`
+        };
+      }
+
+      if (!order.reduceOnly) {
+        available -= requiredMargin;
+      }
+
+      console.log("📊 Order context (OKX):");
+      console.log(`   Instrument: ${instId}`);
+      console.log(`   Side: ${order.side} (${order.posSide ?? "net"})`);
+      console.log(`   Contracts: ${quantityCheck.contracts}`);
+      console.log(`   Quantity: ${quantityCheck.adjustedQuantity}`);
+      console.log(`   Market price: ${marketPrice.toFixed(2)} ${balanceInfo.currency}`);
+      console.log(`   Notional: ${notional.toFixed(2)} ${balanceInfo.currency}`);
+      console.log(`   Leverage: ${leverage}x`);
+      console.log(`   Reduce only: ${order.reduceOnly}`);
+
+      await this.configureLeverage(instId, leverage, order.posSide);
+
+      const response = await client.placeOrder(
+        buildOrderParams({
+          instId,
+          contracts: quantityCheck.contracts,
+          side: order.side,
+          reduceOnly: order.reduceOnly,
+          posSide: order.posSide
+        })
+      );
+
+      if (response.sCode && response.sCode !== "0") {
+        throw new Error(`OKX error ${response.sCode}: ${response.sMsg}`);
+      }
+
+      messageParts.push(`ordId=${response.ordId ?? "unknown"}`);
+    }
+
+    if (messageParts.length === 0) {
+      return {
+        decisionId: decision.id,
+        success: false,
+        message: "No executable orders after sizing adjustments."
+      };
+    }
+
+    const stopContracts = verifyQuantity(decision.signal.quantity, instrument, marketPrice, {
+      rounding: "down",
+      silent: true
+    }).contracts;
+
+    const shouldPlaceStops = stopContracts > 0 && decision.signal.quantity > 0;
+    const stops = shouldPlaceStops
+      ? await this.setupStops(
+          decision,
+          instId,
+          stopContracts,
+          false,
+          decision.signal.side === "LONG" ? "long" : "short"
+        )
+      : {};
+
+    if (stops.algoId) {
+      messageParts.push(`tpslAlgo=${stops.algoId}`);
+    }
+
+    return {
+      decisionId: decision.id,
+      success: true,
+      message: `Order placed (${messageParts.join(", ")})`
+    };
+  }
+
   private async setupStops(
     decision: Decision,
     instId: string,
@@ -195,7 +446,7 @@ export class OkxExecutor implements ExchangeExecutor {
     reduceOnly: boolean,
     entryPosSide?: "long" | "short"
   ): Promise<{ algoId?: string }> {
-    if (!this.client || reduceOnly) {
+    if (!this.client || reduceOnly || contracts <= 0) {
       return {};
     }
 
@@ -211,7 +462,7 @@ export class OkxExecutor implements ExchangeExecutor {
       side: decision.signal.side === "LONG" ? "sell" : "buy",
       ordType: "conditional",
       sz: trimFloat(contracts),
-      reduceOnly: "true",
+      reduceOnly: true,
       tpTriggerPx: exitPlan.profit_target ? trimFloat(exitPlan.profit_target) : undefined,
       tpOrdPx: exitPlan.profit_target ? "-1" : undefined,
       slTriggerPx: exitPlan.stop_loss ? trimFloat(exitPlan.stop_loss) : undefined,
@@ -311,7 +562,7 @@ function buildOrderParams(params: {
     side: params.side,
     ordType: "market",
     sz: trimFloat(params.contracts),
-    reduceOnly: params.reduceOnly ? "true" : "false"
+    reduceOnly: params.reduceOnly
   };
 
   if (POS_MODE === "long_short" && params.posSide) {
@@ -324,29 +575,62 @@ function buildOrderParams(params: {
 function verifyQuantity(
   quantity: number,
   instrument: OkxInstrumentMeta,
-  marketPrice: number
+  marketPrice: number,
+  options: { rounding?: "up" | "down"; silent?: boolean } = {}
 ): { contracts: number; minQuantity: number; adjustedQuantity: number } {
   const ctVal = instrument.ctVal || 1;
   const lotSize = instrument.lotSz || 1;
   const minSz = instrument.minSz || lotSize;
+  const rounding = options.rounding ?? "up";
+  const silent = options.silent ?? false;
+
+  if (quantity <= 0 || ctVal <= 0) {
+    return {
+      contracts: 0,
+      minQuantity: minSz * ctVal,
+      adjustedQuantity: 0
+    };
+  }
 
   const contractsRaw = quantity / ctVal;
-  let contracts = Math.ceil(contractsRaw / lotSize) * lotSize;
-  if (contracts < minSz) {
-    contracts = minSz;
+  let contracts: number;
+  if (rounding === "down") {
+    contracts = Math.floor(contractsRaw / lotSize) * lotSize;
+    if (contracts < minSz) {
+      contracts = 0;
+    }
+  } else {
+    contracts = Math.ceil(contractsRaw / lotSize) * lotSize;
+    if (contracts < minSz) {
+      contracts = minSz;
+    }
+  }
+
+  if (contracts < 0) {
+    contracts = 0;
+  }
+
+  if (contracts === 0) {
+    return {
+      contracts: 0,
+      minQuantity: minSz * ctVal,
+      adjustedQuantity: 0
+    };
   }
 
   const adjustedQuantity = contracts * ctVal;
 
-  console.log("📏 Quantity check:");
-  console.log(`   Instrument: ${instrument.instId}`);
-  console.log(`   Contract size (ctVal): ${ctVal}`);
-  console.log(`   Lot size: ${lotSize}`);
-  console.log(`   Min contracts: ${minSz}`);
-  console.log(`   Requested quantity: ${quantity}`);
-  console.log(`   Adjusted contracts: ${contracts}`);
-  console.log(`   Adjusted quantity: ${adjustedQuantity}`);
-  console.log(`   Notional @market: ${(adjustedQuantity * marketPrice).toFixed(2)}`);
+  if (!silent) {
+    console.log("📏 Quantity check:");
+    console.log(`   Instrument: ${instrument.instId}`);
+    console.log(`   Contract size (ctVal): ${ctVal}`);
+    console.log(`   Lot size: ${lotSize}`);
+    console.log(`   Min contracts: ${minSz}`);
+    console.log(`   Requested quantity: ${quantity}`);
+    console.log(`   Adjusted contracts: ${contracts}`);
+    console.log(`   Adjusted quantity: ${adjustedQuantity}`);
+    console.log(`   Notional @market: ${(adjustedQuantity * marketPrice).toFixed(2)}`);
+  }
 
   return {
     contracts,
@@ -355,40 +639,46 @@ function verifyQuantity(
   };
 }
 
-function analyzePositions(positions: PositionInfo[], side: "LONG" | "SHORT"): PositionState {
-  if (POS_MODE === "long_short") {
-    const longPos = positions.find((pos) => pos.posSide === "long")?.pos ?? 0;
-    const shortPos = positions.find((pos) => pos.posSide === "short")?.pos ?? 0;
+function extractLongShortContracts(positions: PositionInfo[]): {
+  longContracts: number;
+  shortContracts: number;
+} {
+  let longContracts = 0;
+  let shortContracts = 0;
 
-    if (side === "LONG") {
-      return {
-        sameSideContracts: Math.abs(longPos),
-        oppositeContracts: Math.abs(shortPos),
-        entryPosSide: "long",
-        closePosSide: "short"
-      };
+  for (const pos of positions) {
+    if (!pos) continue;
+    const value = pos.pos;
+    const abs = Math.abs(value);
+
+    if (pos.posSide === "long") {
+      longContracts = abs;
+    } else if (pos.posSide === "short") {
+      shortContracts = abs;
+    } else if (value > 0) {
+      longContracts = abs;
+    } else if (value < 0) {
+      shortContracts = abs;
     }
-
-    return {
-      sameSideContracts: Math.abs(shortPos),
-      oppositeContracts: Math.abs(longPos),
-      entryPosSide: "short",
-      closePosSide: "long"
-    };
   }
 
-  const net = positions.reduce((sum, pos) => sum + pos.pos, 0);
-  if (side === "LONG") {
-    return {
-      sameSideContracts: net > 0 ? Math.abs(net) : 0,
-      oppositeContracts: net < 0 ? Math.abs(net) : 0
-    };
+  return { longContracts, shortContracts };
+}
+
+function isPureReduction(currentContracts: number, targetContracts: number): boolean {
+  if (targetContracts === 0) {
+    return currentContracts !== 0;
   }
 
-  return {
-    sameSideContracts: net < 0 ? Math.abs(net) : 0,
-    oppositeContracts: net > 0 ? Math.abs(net) : 0
-  };
+  if (currentContracts === 0) {
+    return false;
+  }
+
+  if (Math.sign(currentContracts) !== Math.sign(targetContracts)) {
+    return false;
+  }
+
+  return Math.abs(targetContracts) < Math.abs(currentContracts);
 }
 
 function extractBalance(raw: any[], instId: string): BalanceInfo {

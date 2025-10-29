@@ -1,5 +1,14 @@
-import axios, { AxiosRequestConfig } from "axios";
-import crypto from "node:crypto";
+import {
+  RestClient,
+  type AlgoOrderRequest,
+  type AlgoOrderResult,
+  type CancelAlgoOrderRequest,
+  type Instrument,
+  type InstrumentType,
+  type OrderRequest,
+  type OrderResult,
+  type Ticker
+} from "okx-api";
 
 export interface OkxInstrumentMeta {
   instId: string;
@@ -15,9 +24,8 @@ export interface OkxOrderParams {
   side: "buy" | "sell";
   ordType: "market";
   sz: string;
-  reduceOnly?: "true" | "false";
+  reduceOnly?: boolean;
   posSide?: "long" | "short";
-  [key: string]: string | undefined;
 }
 
 export interface OkxOrderResponse {
@@ -33,7 +41,7 @@ export interface OkxAlgoOrderParams {
   side: "buy" | "sell";
   ordType: "conditional" | "oco";
   sz: string;
-  reduceOnly?: "true" | "false";
+  reduceOnly?: boolean;
   tpTriggerPx?: string;
   tpOrdPx?: string;
   slTriggerPx?: string;
@@ -54,7 +62,6 @@ export interface OkxLeverageParams {
   lever: string;
   mgnMode: "cross" | "isolated";
   posSide?: "long" | "short";
-  [key: string]: string | undefined;
 }
 
 export interface OkxHttpClientOptions {
@@ -62,17 +69,12 @@ export interface OkxHttpClientOptions {
   simulated?: boolean;
 }
 
-const DEFAULT_BASE_URL = "https://www.okx.com";
+type PositionMode = "net_mode" | "long_short_mode";
 
 export class OkxHttpClient {
-  private readonly apiKey: string;
-  private readonly apiSecret: string;
-  private readonly passphrase: string;
-  private readonly baseUrl: string;
-  private readonly simulated: boolean;
-
+  private readonly client: RestClient;
   private readonly instrumentCache = new Map<string, OkxInstrumentMeta>();
-  private positionMode?: "net_mode" | "long_short_mode";
+  private positionMode?: PositionMode;
 
   constructor(
     apiKey: string,
@@ -80,42 +82,50 @@ export class OkxHttpClient {
     passphrase: string,
     options: OkxHttpClientOptions = {}
   ) {
-    this.apiKey = apiKey;
-    this.apiSecret = apiSecret;
-    this.passphrase = passphrase;
-    this.baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
-    this.simulated = options.simulated ?? false;
+    this.client = new RestClient({
+      apiKey,
+      apiSecret,
+      apiPass: passphrase,
+      baseUrl: options.baseUrl,
+      demoTrading: options.simulated ?? false,
+      parse_exceptions: false
+    });
   }
 
   async placeOrder(params: OkxOrderParams): Promise<OkxOrderResponse> {
-    const endpoint = "/api/v5/trade/order";
-    const payload = {
-      ...params,
-      reduceOnly: params.reduceOnly ?? "false"
+    const request: OrderRequest = {
+      instId: params.instId,
+      tdMode: params.tdMode,
+      side: params.side,
+      ordType: params.ordType,
+      sz: params.sz,
+      posSide: params.posSide,
+      reduceOnly: params.reduceOnly
     };
 
-    const response = await this.request("POST", endpoint, payload);
-    const [result] = (response as any[]) ?? [];
-
-    return {
-      ordId: result?.ordId ?? "",
-      clOrdId: result?.clOrdId,
-      sCode: result?.sCode,
-      sMsg: result?.sMsg
-    };
+    const [result] = await this.client.submitOrder(request);
+    return normalizeOrderResult(result);
   }
 
   async placeAlgoOrder(params: OkxAlgoOrderParams): Promise<OkxAlgoOrderResponse> {
-    const endpoint = "/api/v5/trade/order-algo";
-    const payload: Record<string, unknown> = { ...params };
-    const response = await this.request("POST", endpoint, payload);
-    const [result] = (response as any[]) ?? [];
-
-    return {
-      algoId: result?.algoId ?? "",
-      sCode: result?.sCode,
-      sMsg: result?.sMsg
+    const request: AlgoOrderRequest = {
+      instId: params.instId,
+      tdMode: params.tdMode,
+      side: params.side,
+      ordType: params.ordType,
+      sz: params.sz,
+      posSide: params.posSide,
+      reduceOnly: params.reduceOnly,
+      tpTriggerPx: params.tpTriggerPx,
+      tpOrdPx: params.tpOrdPx,
+      tpTriggerPxType: params.tpTriggerPxType,
+      slTriggerPx: params.slTriggerPx,
+      slOrdPx: params.slOrdPx,
+      slTriggerPxType: params.slTriggerPxType
     };
+
+    const [result] = await this.client.placeAlgoOrder(request);
+    return normalizeAlgoResult(result);
   }
 
   async cancelAlgoOrders(
@@ -125,30 +135,30 @@ export class OkxHttpClient {
       return;
     }
 
-    await this.request("POST", "/api/v5/trade/cancel-algos", orders as unknown as Array<unknown>);
+    await this.client.cancelAlgoOrder(orders as CancelAlgoOrderRequest[]);
   }
 
   async setLeverage(params: OkxLeverageParams): Promise<void> {
-    await this.request("POST", "/api/v5/account/set-leverage", params);
+    await this.client.setLeverage({
+      instId: params.instId,
+      lever: params.lever,
+      mgnMode: params.mgnMode,
+      posSide: params.posSide
+    });
   }
 
   async ensurePositionMode(mode: "net" | "long_short"): Promise<void> {
-    const target = mode === "long_short" ? "long_short_mode" : "net_mode";
+    const target: PositionMode = mode === "long_short" ? "long_short_mode" : "net_mode";
     if (this.positionMode === target) {
       return;
     }
 
     try {
-      await this.request("POST", "/api/v5/account/set-position-mode", {
-        posMode: target
-      });
+      await this.client.setPositionMode({ posMode: target });
       this.positionMode = target;
     } catch (error) {
-      const message = (error as Error).message;
-      if (
-        message.includes("Operation failed") ||
-        message.includes("Same mode")
-      ) {
+      const message = extractErrorMessage(error);
+      if (message.includes("Same mode")) {
         this.positionMode = target;
         return;
       }
@@ -156,25 +166,19 @@ export class OkxHttpClient {
     }
   }
 
-  async getInstrument(
-    instId: string,
-    instType: string
-  ): Promise<OkxInstrumentMeta> {
+  async getInstrument(instId: string, instType: string): Promise<OkxInstrumentMeta> {
     const cacheKey = `${instType}_${instId}`;
-    if (this.instrumentCache.has(cacheKey)) {
-      return this.instrumentCache.get(cacheKey)!;
+    const cached = this.instrumentCache.get(cacheKey);
+    if (cached) {
+      return cached;
     }
 
-    const response = (await this.request(
-      "GET",
-      "/api/v5/public/instruments",
-      {
-        instType,
-        instId
-      }
-    )) as any[];
+    const instruments = (await this.client.getInstruments({
+      instType: instType as InstrumentType,
+      instId
+    })) as Instrument[];
 
-    const instrument = response?.find((item) => item.instId === instId);
+    const instrument = instruments?.find((item) => item.instId === instId);
     if (!instrument) {
       throw new Error(`Instrument ${instId} not found on OKX`);
     }
@@ -191,94 +195,21 @@ export class OkxHttpClient {
     return meta;
   }
 
-  private async request(
-    method: "GET" | "POST",
-    path: string,
-    params?: Record<string, unknown> | Array<unknown>
-  ): Promise<unknown> {
-    let requestPath = path;
-    let bodyString = "";
-
-    if (method === "GET" && params && !Array.isArray(params)) {
-      const query = buildQuery(params);
-      if (query) {
-        requestPath = `${path}?${query}`;
-      }
-    } else if (method === "POST" && params !== undefined) {
-      bodyString = JSON.stringify(params);
-    }
-
-    const timestamp = new Date().toISOString();
-    const sign = this.sign(timestamp, method, requestPath, bodyString);
-
-    const config: AxiosRequestConfig = {
-      method,
-      url: `${this.baseUrl}${requestPath}`,
-      headers: {
-        "OK-ACCESS-KEY": this.apiKey,
-        "OK-ACCESS-SIGN": sign,
-        "OK-ACCESS-TIMESTAMP": timestamp,
-        "OK-ACCESS-PASSPHRASE": this.passphrase,
-        "Content-Type": "application/json",
-        Accept: "application/json"
-      }
-    };
-
-    if (this.simulated) {
-      (config.headers as Record<string, unknown>)["x-simulated-trading"] = 1;
-    }
-
-    if (method === "POST" && bodyString) {
-      config.data = bodyString;
-    }
-
-    try {
-      const response = await axios(config);
-      const data = response.data;
-      if (data?.code && data.code !== "0") {
-        throw new Error(`OKX API error (${data.code}): ${data.msg}`);
-      }
-      return data?.data ?? [];
-    } catch (error) {
-      if (axios.isAxiosError(error) && error.response) {
-        const data = error.response.data;
-        throw new Error(
-          `OKX request failed (${error.response.status}): ${
-            typeof data === "string" ? data : JSON.stringify(data)
-          }`
-        );
-      }
-      throw error;
-    }
-  }
-
-  private sign(
-    timestamp: string,
-    method: "GET" | "POST",
-    path: string,
-    body: string
-  ): string {
-    const message = `${timestamp}${method}${path}${body}`;
-    return crypto
-      .createHmac("sha256", this.apiSecret)
-      .update(message)
-      .digest("base64");
-  }
-
   async getAccountBalance(): Promise<any[]> {
-    return (await this.request("GET", "/api/v5/account/balance")) as any[];
+    const balances = await this.client.getBalance();
+    return Array.isArray(balances) ? balances : [];
   }
 
   async getPositions(instId?: string): Promise<any[]> {
     const params = instId ? { instId } : undefined;
-    return (await this.request("GET", "/api/v5/account/positions", params)) as any[];
+    const positions = await this.client.getPositions(params);
+    return Array.isArray(positions) ? positions : [];
   }
 
   async getTicker(instId: string): Promise<number> {
-    const data = (await this.request("GET", "/api/v5/market/ticker", {
-      instId
-    })) as any[];
-    const price = data?.[0]?.last ?? data?.[0]?.idxPx;
+    const tickers = (await this.client.getTicker({ instId })) as Ticker[];
+    const record: Ticker | undefined = Array.isArray(tickers) ? tickers[0] : undefined;
+    const price = record?.last ?? record?.askPx ?? record?.bidPx;
     const num = parseFloat(price ?? "0");
     if (!Number.isFinite(num) || num <= 0) {
       throw new Error(`Failed to fetch ticker for ${instId}`);
@@ -287,11 +218,56 @@ export class OkxHttpClient {
   }
 }
 
-function buildQuery(params: Record<string, unknown>): string {
-  const search = new URLSearchParams();
-  for (const [key, value] of Object.entries(params)) {
-    if (value === undefined || value === null) continue;
-    search.append(key, String(value));
+function normalizeOrderResult(result?: OrderResult): OkxOrderResponse {
+  if (!result) {
+    return {
+      ordId: "",
+      sCode: "Unknown",
+      sMsg: "Empty response from OKX submitOrder"
+    };
   }
-  return search.toString();
+
+  return {
+    ordId: result.ordId,
+    clOrdId: result.clOrdId,
+    sCode: result.sCode,
+    sMsg: result.sMsg
+  };
+}
+
+function normalizeAlgoResult(result?: AlgoOrderResult): OkxAlgoOrderResponse {
+  if (!result) {
+    return {
+      algoId: "",
+      sCode: "Unknown",
+      sMsg: "Empty response from OKX placeAlgoOrder"
+    };
+  }
+
+  return {
+    algoId: result.algoId,
+    sCode: result.sCode,
+    sMsg: result.sMsg
+  };
+}
+
+function extractErrorMessage(error: unknown): string {
+  if (!error) {
+    return "Unknown error";
+  }
+
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  if (typeof error === "object") {
+    const maybeMsg = (error as { msg?: unknown; message?: unknown }).msg ?? (error as {
+      message?: unknown;
+    }).message;
+    if (maybeMsg !== undefined) {
+      return String(maybeMsg);
+    }
+  }
+
+  return String(error);
 }
