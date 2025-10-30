@@ -46,7 +46,6 @@ export class BinanceExecutor implements ExchangeExecutor {
     }
 
     const symbol = normalizeSymbol(decision.signal.symbol);
-    const orderSide = decision.signal.side === "LONG" ? "BUY" : "SELL";
     const desiredLeverage = DEFAULT_LEVERAGE ?? decision.signal.leverage ?? 1;
 
     try {
@@ -62,45 +61,63 @@ export class BinanceExecutor implements ExchangeExecutor {
 
       const existing = positions.find((position) => position.symbol === symbol);
       const currentAmt = existing?.positionAmt ?? 0;
-      const orderDirection = orderSide === "BUY" ? 1 : -1;
-      const currentDirection = Math.sign(currentAmt);
-      const isOpposite = currentDirection !== 0 && currentDirection !== orderDirection;
-      const reduceOnly = FORCE_REDUCE_ONLY || decision.reasonCode.includes("EXIT") || isOpposite;
+      const targetAmt = decision.signal.side === "LONG" ? decision.signal.quantity : -decision.signal.quantity;
+      const delta = targetAmt - currentAmt;
 
-      let orderQuantity = decision.signal.quantity;
-      let closePosition = false;
+      if (Math.abs(delta) < 1e-10) {
+        return {
+          decisionId: decision.id,
+          success: true,
+          message: "Position already aligned with signal."
+        };
+      }
 
-      if (isOpposite) {
-        const closable = Math.abs(currentAmt);
-        if (closable <= 0) {
+      const orderSide = delta > 0 ? "BUY" : "SELL";
+      const orderQuantity = Math.abs(delta);
+      const sameSign =
+        currentAmt !== 0 &&
+        targetAmt !== 0 &&
+        Math.sign(currentAmt) === Math.sign(targetAmt);
+      const pureReduction = sameSign && Math.abs(targetAmt) < Math.abs(currentAmt);
+      const closingAll = targetAmt === 0 && currentAmt !== 0;
+      const forceReduceOnly = FORCE_REDUCE_ONLY || decision.reasonCode.includes("EXIT");
+
+      if (forceReduceOnly && !pureReduction && !closingAll) {
+        return {
+          decisionId: decision.id,
+          success: false,
+          message: "FORCE_REDUCE_ONLY is enabled; refusing to increase exposure."
+        };
+      }
+
+      const reduceOnly = forceReduceOnly || pureReduction || closingAll;
+      const crossingZero =
+        currentAmt !== 0 && targetAmt !== 0 && Math.sign(currentAmt) !== Math.sign(targetAmt);
+
+      const leverage = desiredLeverage > 0 ? desiredLeverage : 1;
+      if (!reduceOnly && !crossingZero) {
+        let additionalQuantity: number;
+        if (currentAmt === 0) {
+          additionalQuantity = Math.abs(targetAmt);
+        } else if (sameSign) {
+          additionalQuantity = Math.max(Math.abs(targetAmt) - Math.abs(currentAmt), 0);
+        } else {
+          additionalQuantity = Math.abs(targetAmt);
+        }
+
+        const requiredMargin = (additionalQuantity * marketPrice) / leverage;
+        if (additionalQuantity > 0 && account.availableBalance < requiredMargin) {
           return {
             decisionId: decision.id,
             success: false,
-            message: "No open position to close on Binance; skipping reduce-only order."
+            message: `Insufficient balance: required ${requiredMargin.toFixed(
+              2
+            )}, available ${account.availableBalance.toFixed(2)} USDT`
           };
-        }
-
-        if (orderQuantity >= closable) {
-          orderQuantity = closable;
-          closePosition = true;
-        } else {
-          closePosition = false;
         }
       }
 
       const notional = orderQuantity * marketPrice;
-      const leverage = desiredLeverage > 0 ? desiredLeverage : 1;
-      const requiredMargin = notional / leverage;
-
-      if (!reduceOnly && account.availableBalance < requiredMargin) {
-        return {
-          decisionId: decision.id,
-          success: false,
-          message: `Insufficient balance: required ${requiredMargin.toFixed(
-            2
-          )}, available ${account.availableBalance.toFixed(2)} USDT`
-        };
-      }
 
       console.log("📊 Order context (Binance):");
       console.log(`   Symbol: ${symbol}`);
@@ -110,23 +127,24 @@ export class BinanceExecutor implements ExchangeExecutor {
       console.log(`   Notional: ${notional.toFixed(2)} USDT`);
       console.log(`   Leverage: ${leverage}x`);
       console.log(`   Reduce only: ${reduceOnly}`);
-      if (closePosition) {
-        console.log("   Close position: true");
-      }
 
       const orderParams: PlaceOrderParams = {
         symbol,
         side: orderSide,
         type: "MARKET",
         quantity: orderQuantity,
-        reduceOnly,
-        closePosition
+        reduceOnly
       };
 
-      const mainOrder = await this.client.placeOrder(orderParams);
-      const stops = await this.setupStops(decision, symbol, orderSide, orderQuantity, reduceOnly);
+      const response = await this.client.placeOrder(orderParams);
 
-      const messageParts = [`orderId=${mainOrder.orderId}`];
+      const finalExposure = Math.abs(targetAmt);
+      const stops =
+        !reduceOnly && finalExposure > 0
+          ? await this.setupStops(decision, symbol, orderSide, finalExposure)
+          : {};
+
+      const messageParts = [`ordId=${response.orderId}`];
       if (stops.takeProfitId) {
         messageParts.push(`tp=${stops.takeProfitId}`);
       }
@@ -152,10 +170,9 @@ export class BinanceExecutor implements ExchangeExecutor {
     decision: Decision,
     symbol: string,
     entrySide: "BUY" | "SELL",
-    quantity: number,
-    reduceOnly: boolean
+    quantity: number
   ): Promise<{ takeProfitId?: number; stopLossId?: number }> {
-    if (!this.client || reduceOnly) {
+    if (!this.client || quantity <= 0) {
       return {};
     }
 
@@ -178,7 +195,6 @@ export class BinanceExecutor implements ExchangeExecutor {
           quantity,
           stopPrice: exitPlan.profit_target,
           reduceOnly: true,
-          closePosition: true,
           workingType: "MARK_PRICE"
         });
         results.takeProfitId = tpOrder.orderId;
@@ -199,7 +215,6 @@ export class BinanceExecutor implements ExchangeExecutor {
           quantity,
           stopPrice: exitPlan.stop_loss,
           reduceOnly: true,
-          closePosition: true,
           workingType: "MARK_PRICE"
         });
         results.stopLossId = slOrder.orderId;

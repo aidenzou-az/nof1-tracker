@@ -191,18 +191,30 @@ export class OkxExecutor implements ExchangeExecutor {
       };
     }
 
-    const notional = quantityCheck.adjustedQuantity * marketPrice;
-    const requiredMargin = notional / leverage;
+    const crossingZero =
+      currentNetContracts !== 0 && Math.sign(currentNetContracts) !== Math.sign(targetContractsSigned);
+    let requiredMargin = 0;
 
-    if (!reduceOnly && balanceInfo.available < requiredMargin) {
-      return {
-        decisionId: decision.id,
-        success: false,
-        message: `Insufficient balance: required ${requiredMargin.toFixed(
-          2
-        )}, available ${balanceInfo.available.toFixed(2)} ${balanceInfo.currency}`
-      };
+    if (!reduceOnly && !crossingZero) {
+      const additionalContracts = Math.max(
+        Math.abs(targetContractsSigned) - Math.abs(currentNetContracts),
+        0
+      );
+      const additionalQuantity = additionalContracts * ctVal;
+      requiredMargin = (additionalQuantity * marketPrice) / leverage;
+
+      if (additionalQuantity > 0 && balanceInfo.available < requiredMargin) {
+        return {
+          decisionId: decision.id,
+          success: false,
+          message: `Insufficient balance: required ${requiredMargin.toFixed(
+            2
+          )}, available ${balanceInfo.available.toFixed(2)} ${balanceInfo.currency}`
+        };
+      }
     }
+
+    const notional = quantityCheck.adjustedQuantity * marketPrice;
 
     console.log("📊 Order context (OKX):");
     console.log(`   Instrument: ${instId}`);
@@ -213,6 +225,9 @@ export class OkxExecutor implements ExchangeExecutor {
     console.log(`   Notional: ${notional.toFixed(2)} ${balanceInfo.currency}`);
     console.log(`   Leverage: ${leverage}x`);
     console.log(`   Reduce only: ${reduceOnly}`);
+    if (!reduceOnly && !crossingZero && requiredMargin > 0) {
+      console.log(`   Margin check (incremental): ${requiredMargin.toFixed(2)} ${balanceInfo.currency}`);
+    }
 
     await this.configureLeverage(instId, leverage);
 
