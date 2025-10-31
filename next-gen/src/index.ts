@@ -2,8 +2,8 @@
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { AgentAccount, Nof1Response, Position } from "./types/nof1";
-import { buildSignal } from "./services/signal-normalizer";
+import { AgentAccount, Nof1Response } from "./types/nof1";
+import { paths } from "./config/paths";
 import { buildRecord, RawSignalStore } from "./services/raw-signal-store";
 import { NormalizedSignal, RawSignalRecord } from "./types/signal";
 import { Guard } from "./guards/types";
@@ -15,6 +15,9 @@ import { Decision, DecisionAction } from "./types/decision";
 import { DecisionStore } from "./services/decision-store";
 import { fetchAgentAccounts } from "./services/signal-fetcher";
 import { createExchangeExecutor } from "./exchange/factory";
+import { buildBundlesFromAccounts, SignalBundle } from "./services/signal-bundler";
+import { extractPosition, formatPositionSummary } from "./services/position-formatter";
+import { clearWatchState, filterBundlesWithState, loadWatchState, saveWatchState, WatchState } from "./services/watch-state";
 
 interface CliOptions {
   input?: string;
@@ -37,12 +40,10 @@ interface CliOptions {
   marker?: number;
   apiBase?: string;
   interval?: number;
-}
-
-interface SignalBundle {
-  normalized: NormalizedSignal;
-  raw: Record<string, unknown>;
-  meta: RawSignalRecord["meta"];
+  pretty?: boolean;
+  stateFile?: string;
+  resetState?: boolean;
+  useState?: boolean;
 }
 
 interface ParsedCli {
@@ -68,6 +69,9 @@ async function main(): Promise<void> {
       break;
     case "replay":
       await handleReplay(options);
+      break;
+    case "positions":
+      await handlePositions(options);
       break;
     case "help":
     case undefined:
@@ -108,6 +112,9 @@ async function handleRecord(options: CliOptions): Promise<void> {
   const guardConfig = options.guardsConfigPath ? loadGuardConfig(options.guardsConfigPath) : undefined;
   const guardPipeline = createGuardPipeline(options, guardConfig);
   const bundles = buildBundlesFromAccounts(accounts, options.source ?? "file", inputPath);
+  if (options.pretty) {
+    process.stdout.write(formatPositionSummary(bundles));
+  }
   const { evaluations, decisions, rawRecords } = processSignalBundles(bundles, guardPipeline, options);
 
   const shouldPersist = !options.dryRun;
@@ -126,6 +133,45 @@ async function handleRecord(options: CliOptions): Promise<void> {
 
   await executeDecisions(decisions, options);
   await persistDecisions(decisions, shouldPersist, `💾 Saved ${decisions.length} decision(s) to decisions.ndjson`);
+}
+
+async function handlePositions(options: CliOptions): Promise<void> {
+  let accounts: AgentAccount[] = [];
+
+  if (options.input) {
+    const inputPath = resolve(process.cwd(), options.input);
+    try {
+      const rawContent = readFileSync(inputPath, "utf8");
+      const parsed = JSON.parse(rawContent) as Nof1Response | AgentAccount | AgentAccount[];
+      accounts = normalizeToAccounts(parsed);
+    } catch (error) {
+      console.error(`Failed to read or parse ${options.input}:`, (error as Error).message);
+      process.exitCode = 1;
+      return;
+    }
+  } else {
+    try {
+      accounts = await fetchAgentAccounts({
+        baseUrl: options.apiBase,
+        marker: options.marker,
+        agents: options.agents
+      });
+    } catch (error) {
+      console.error(`Failed to fetch signals: ${(error as Error).message}`);
+      process.exitCode = 1;
+      return;
+    }
+  }
+
+  if (accounts.length === 0) {
+    console.log("No accounts returned. Nothing to display.");
+    return;
+  }
+
+  const bundles = buildBundlesFromAccounts(accounts, options.source ?? "positions", options.input);
+  process.stdout.write(
+    formatPositionSummary(bundles, `Agent Positions (latest @ ${new Date().toISOString()})`)
+  );
 }
 
 async function handleFetch(options: CliOptions): Promise<void> {
@@ -163,7 +209,34 @@ async function handleFetch(options: CliOptions): Promise<void> {
 
   const guardConfig = options.guardsConfigPath ? loadGuardConfig(options.guardsConfigPath) : undefined;
   const guardPipeline = createGuardPipeline(options, guardConfig);
-  const bundles = buildBundlesFromAccounts(accounts, options.source ?? "nof1-api", options.input);
+  let bundles = buildBundlesFromAccounts(accounts, options.source ?? "nof1-api", options.input);
+
+  let nextWatchState: WatchState | undefined;
+  const usingState = options.useState ?? false;
+  const stateFilePath = usingState ? resolveStateFilePath(options) : undefined;
+
+  if (usingState) {
+    if (options.resetState && stateFilePath) {
+      clearWatchState(stateFilePath);
+    }
+    const currentState = stateFilePath ? loadWatchState(stateFilePath) : { agents: {} };
+    const filtered = filterBundlesWithState(bundles, currentState);
+    if (filtered.skipped > 0) {
+      console.log(`ℹ️ Skipped ${filtered.skipped} previously processed position(s).`);
+    }
+    bundles = filtered.bundles;
+    nextWatchState = filtered.nextState;
+  }
+
+  if (options.pretty) {
+    process.stdout.write(formatPositionSummary(bundles));
+  }
+
+  if (usingState && bundles.length === 0) {
+    console.log("No new signals to process.");
+    return;
+  }
+
   const { evaluations, decisions, rawRecords } = processSignalBundles(bundles, guardPipeline, options);
 
   const shouldPersist = !options.dryRun;
@@ -182,6 +255,10 @@ async function handleFetch(options: CliOptions): Promise<void> {
 
   await executeDecisions(decisions, options);
   await persistDecisions(decisions, shouldPersist, `💾 Saved ${decisions.length} decision(s) to decisions.ndjson`);
+
+  if (usingState && nextWatchState && !options.dryRun && stateFilePath) {
+    saveWatchState(nextWatchState, stateFilePath);
+  }
 }
 
 async function handleWatch(options: CliOptions): Promise<void> {
@@ -224,6 +301,9 @@ async function handleReplay(options: CliOptions): Promise<void> {
     raw: event.raw,
     meta: event.meta
   }));
+  if (options.pretty) {
+    process.stdout.write(formatPositionSummary(bundles));
+  }
 
   const { evaluations, decisions } = processSignalBundles(bundles, guardPipeline, options);
 
@@ -328,6 +408,9 @@ function parseCli(argv: string[]): ParsedCli {
       case "--guards-config":
         options.guardsConfigPath = rest[++i];
         break;
+      case "--pretty":
+        options.pretty = true;
+        break;
       case "--guard-filter":
         options.auditGuard = rest[++i];
         break;
@@ -364,6 +447,18 @@ function parseCli(argv: string[]): ParsedCli {
       case "--api-base":
         options.apiBase = rest[++i];
         break;
+      case "--stateful":
+        options.useState = true;
+        break;
+      case "--stateless":
+        options.useState = false;
+        break;
+      case "--state-file":
+        options.stateFile = rest[++i];
+        break;
+      case "--reset-state":
+        options.resetState = true;
+        break;
       case "--interval": {
         const value = parseFloat(rest[++i] ?? "");
         if (Number.isNaN(value) || value <= 0) {
@@ -388,22 +483,25 @@ Usage: node dist/index.js <command> [options]
 Commands:
   record --input <file> [--source name] [--dry-run] [--verbose]
          [--price-tolerance pct] [--max-age seconds] [--max-notional value]
-         [--guards g1,g2] [--guards-config path] [--simulate]
+         [--guards g1,g2] [--guards-config path] [--simulate] [--pretty]
          [--execute] [--exchange name]
          记录原始 agent 信号到日志并运行 Guard/生成决策
 
   fetch [--agents a1,a2] [--marker value] [--api-base url]
         [--price-tolerance pct] [--max-age seconds] [--max-notional value]
-        [--guards g1,g2] [--guards-config path] [--simulate]
+        [--guards g1,g2] [--guards-config path] [--simulate] [--pretty]
         [--execute] [--exchange name]
         从 nof1 API 抓取最新信号并运行 Guard/生成决策
+
+  positions [--agents a1,a2] [--marker value] [--api-base url] [--input file]
+        仅查看最新 agent 持仓（不会运行 Guard 或生成决策）
 
   watch [--interval seconds] [其余参数同 fetch]
         定时轮询 nof1 API 并运行 Guard/执行（默认每60秒）
 
   replay [--guards g1,g2] [--guards-config path]
          [--price-tolerance pct] [--max-age seconds] [--max-notional value]
-         [--simulate] [--save-decisions] [--verbose]
+         [--simulate] [--save-decisions] [--verbose] [--pretty]
          基于 raw-signals.ndjson 重新跑 Guard/生成决策
 
   audit [--guard-filter name] [--action-filter type] [--reason-code code]
@@ -522,7 +620,7 @@ function buildDecision(
   };
 }
 
-function generateDecisionId(signal: ReturnType<typeof buildSignal>): string {
+function generateDecisionId(signal: NormalizedSignal): string {
   return `${signal.agentId}-${signal.symbol}-${signal.entryOid}-${Date.now()}`;
 }
 
@@ -534,30 +632,6 @@ function logDecisions(decisions: Decision[]): void {
       console.log(`  Reason: ${decision.reason}`);
     }
   }
-}
-
-function buildBundlesFromAccounts(accounts: AgentAccount[], source: string, inputFile?: string): SignalBundle[] {
-  const bundles: SignalBundle[] = [];
-
-  for (const account of accounts) {
-    for (const position of Object.values(account.positions)) {
-      const normalized = buildSignal(account, position, new Date().toISOString());
-      bundles.push({
-        normalized,
-        raw: {
-          accountId: account.id,
-          modelId: account.model_id,
-          position
-        },
-        meta: {
-          source,
-          inputFile
-        }
-      });
-    }
-  }
-
-  return bundles;
 }
 
 function processSignalBundles(
@@ -673,22 +747,20 @@ async function executeDecisions(decisions: Decision[], options: CliOptions): Pro
   }
 }
 
-function extractPosition(raw: Record<string, unknown>): Position | undefined {
-  if (!raw || typeof raw !== "object") {
-    return undefined;
-  }
-
-  const candidate = (raw as Record<string, unknown>).position;
-  if (candidate && typeof candidate === "object") {
-    return candidate as Position;
-  }
-  return undefined;
-}
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+
+
+
+function resolveStateFilePath(options: CliOptions): string {
+  if (options.stateFile) {
+    return resolve(process.cwd(), options.stateFile);
+  }
+  return paths.watchState;
+}
 function resolveGuardNames(options: CliOptions, config?: GuardConfigFile): string[] {
   if (options.guards && options.guards.length > 0) {
     return options.guards.map((name) => name.toLowerCase());

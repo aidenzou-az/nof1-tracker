@@ -42,6 +42,12 @@ npm run dev -- replay --guards-config ./guards.json --save-decisions
 # 每90秒抓取 deepseek 信号并执行 Guard（模拟模式）
 npm run dev -- watch --agents deepseek-chat-v3.1 --interval 90 --guards-config ./guards.json --simulate
 
+# 仅查看最新持仓（不运行 Guard/决策）
+npm run dev -- positions --agents deepseek-chat-v3.1
+
+# 推送最新持仓到飞书（通过 Webhook）
+npm run feishu:positions -- --agents deepseek-chat-v3.1
+
 可选参数说明：
 
 - `--price-tolerance <pct>`：价格容差（默认 1%）。
@@ -52,8 +58,47 @@ npm run dev -- watch --agents deepseek-chat-v3.1 --interval 90 --guards-config .
 - `--simulate`：强制决策为 `SIMULATE`（即使 Guard 通过也不会落为 EXECUTE）。
 - `--execute`：在 Guard 全通过时调用真实执行器（默认关闭）。
 - `--exchange <name>`：选择执行器（`simulator`、`binance`、`okx` / 默认 simulator）。
+- `--pretty`：在 `record`/`fetch`/`replay`/`watch` 中额外打印当前持仓表格。
+- `--stateful` / `--stateless`：开启或关闭去重状态（`watch` 默认开启）。
+- `--state-file <path>`：自定义状态文件路径（默认 `data/next-gen/watch-state.json`）。
+- `--reset-state`：清空状态后再运行，通常在 `watch` 启动前使用一次。
 - `--save-decisions`（仅 `replay`）：将重放后的决策写入 `decisions.ndjson`。
 - `--verbose`：输出所有 Guard 的 PASS/FAIL 详情（不加时只显示失败项）。
+
+### 飞书推送
+
+自带的 `feishu:positions` 脚本会获取最新持仓并通过自定义机器人 Webhook 推送到飞书群。
+
+必备环境变量：
+
+- `FEISHU_WEBHOOK_URL`：飞书自定义机器人 Webhook 地址。
+- `FEISHU_SECRET`：机器人安全设置中的签名密钥。
+
+可选环境变量：
+
+- `POSITIONS_AGENTS`：用逗号分隔的 agent 列表，仅推送这些 agent 的持仓。
+- `NOF1_API_BASE_URL`：自定义 nof1 API base（默认 `https://nof1.ai/api`）。
+- `POSITIONS_HEADING`：自定义推送标题。
+- `POSITIONS_SOURCE`：写入日志的 source 字段（默认 `feishu`）。
+- `DRY_RUN=true`：仅打印格式化结果，不推送。
+
+也支持运行时参数，例如：
+
+```
+FEISHU_WEBHOOK_URL=... FEISHU_SECRET=... \
+npm run feishu:positions -- \
+  --agents deepseek-chat-v3.1,gpt-5 \
+  --heading "夜间持仓检查" \
+  --dry-run
+```
+
+若要定时推送，可结合 `cron`：
+
+```
+*/15 * * * * cd /path/to/nof1-tracker/next-gen && \
+  FEISHU_WEBHOOK_URL=... FEISHU_SECRET=... \
+  npm run feishu:positions -- --agents deepseek-chat-v3.1 >> feishu.log 2>&1
+```
 
 `audit` 命令参数：
 
