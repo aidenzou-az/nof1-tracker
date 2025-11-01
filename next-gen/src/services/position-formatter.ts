@@ -18,6 +18,36 @@ export interface PositionSummaryRow {
   sl: string;
 }
 
+export interface PositionSnapshotAgent {
+  agent: string;
+  positions: PositionSnapshotRow[];
+}
+
+export interface PositionSnapshotRow {
+  symbol: string;
+  side: "LONG" | "SHORT";
+  quantity: number;
+  leverage?: number;
+  entryPrice?: number;
+  currentPrice?: number;
+  unrealizedPnl?: number;
+  profitTarget?: number;
+  stopLoss?: number;
+}
+
+interface PositionRowRaw {
+  agent: string;
+  symbol: string;
+  quantity: number;
+  side: "LONG" | "SHORT";
+  leverage?: number;
+  entryPrice?: number | null;
+  currentPrice?: number | null;
+  unrealizedPnl?: number | null;
+  profitTarget?: number | null;
+  stopLoss?: number | null;
+}
+
 export function extractPosition(raw: Record<string, unknown>): Position | undefined {
   if (!raw || typeof raw !== "object") {
     return undefined;
@@ -33,92 +63,30 @@ export function formatPositionSummary(
   bundles: PositionBundle[],
   heading = "Agent Positions"
 ): string {
-  const latest = new Map<
-    string,
-    {
-      bundle: PositionBundle;
-      position: Position;
-      timestamp: number;
-      marker?: number;
-    }
-  >();
-
-  for (const bundle of bundles) {
-    const position = extractPosition(bundle.raw);
-    if (!position) continue;
-
-    const quantityRaw =
-      typeof position.quantity === "number"
-        ? position.quantity
-        : Number.parseFloat(String(position.quantity ?? NaN));
-
-    if (!Number.isFinite(quantityRaw)) continue;
-    const holdQuantity = Math.abs(quantityRaw);
-    if (holdQuantity <= 1e-8) continue;
-
-    const key = `${bundle.normalized.agentId}::${bundle.normalized.symbol}`;
-    const timestamp = parseTimestamp(bundle.normalized.receivedAt);
-    const marker = Number.isFinite(bundle.normalized.signalMarker)
-      ? bundle.normalized.signalMarker
-      : undefined;
-
-    const existing = latest.get(key);
-    if (!existing) {
-      latest.set(key, { bundle, position, timestamp, marker });
-      continue;
-    }
-
-    if (
-      timestamp > existing.timestamp ||
-      (timestamp === existing.timestamp &&
-        marker !== undefined &&
-        (existing.marker === undefined || marker > existing.marker))
-    ) {
-      latest.set(key, { bundle, position, timestamp, marker });
-    }
-  }
+  const rows = collectLatestPositions(bundles);
 
   const summaries: PositionSummaryRow[] = [];
 
-  for (const snapshot of latest.values()) {
-    const { bundle, position } = snapshot;
-
-    const quantityRaw =
-      typeof position.quantity === "number"
-        ? position.quantity
-        : Number.parseFloat(String(position.quantity ?? NaN));
-    if (!Number.isFinite(quantityRaw)) continue;
-    const holdQuantity = Math.abs(quantityRaw);
-
-    const leverage =
-      bundle.normalized.leverage ??
-      (typeof position.leverage === "number" ? position.leverage : undefined);
-
-    const side = quantityRaw >= 0 ? "LONG" : "SHORT";
-
-    const holdValue = formatNumber(holdQuantity, { digits: 6 });
+  for (const row of rows) {
+    const holdValue = formatNumber(Math.abs(row.quantity), { digits: 6 });
     const hold =
       holdValue !== "—"
-        ? `${holdValue}${leverage ? ` @${leverage}x` : ""}`
-        : leverage
-        ? `— @${leverage}x`
+        ? `${holdValue}${row.leverage ? ` @${row.leverage}x` : ""}`
+        : row.leverage
+        ? `— @${row.leverage}x`
         : "—";
 
-    const entry = formatNumber(position.entry_price ?? bundle.normalized.entryPrice, {
-      digits: 4
-    });
-    const current = formatNumber(position.current_price ?? bundle.normalized.currentPrice, {
-      digits: 4
-    });
-    const unrealized = formatNumber(position.unrealized_pnl, { digits: 2 });
-    const tp = formatNumber(position.exit_plan?.profit_target, { digits: 4 });
-    const sl = formatNumber(position.exit_plan?.stop_loss, { digits: 4 });
+    const entry = formatNumber(row.entryPrice, { digits: 4 });
+    const current = formatNumber(row.currentPrice, { digits: 4 });
+    const unrealized = formatNumber(row.unrealizedPnl, { digits: 2 });
+    const tp = formatNumber(row.profitTarget, { digits: 4 });
+    const sl = formatNumber(row.stopLoss, { digits: 4 });
 
     summaries.push({
-      agent: bundle.normalized.agentId,
-      symbol: bundle.normalized.symbol,
+      agent: row.agent,
+      symbol: row.symbol,
       hold,
-      side,
+      side: row.side,
       entry,
       current,
       unrealized,
@@ -146,7 +114,7 @@ export function formatPositionSummary(
 
   const headers = ["Symbol", "Hold", "Side", "Entry", "Current", "Unrealized", "TP", "SL"];
 
-  for (const [agent, rows] of Array.from(grouped.entries()).sort(([a], [b]) =>
+  for (const [agent, rowsForAgent] of Array.from(grouped.entries()).sort(([a], [b]) =>
     a.localeCompare(b)
   )) {
     output += `\n📦 Agent: ${agent}\n`;
@@ -163,7 +131,7 @@ export function formatPositionSummary(
     ];
 
     const columnWidths = headers.map((header, index) =>
-      Math.max(header.length, ...rows.map((row) => values(row)[index].length))
+      Math.max(header.length, ...rowsForAgent.map((row) => values(row)[index].length))
     );
 
     const topBorder = `┌${columnWidths.map((w) => "─".repeat(w + 2)).join("┬")}┐`;
@@ -178,7 +146,7 @@ export function formatPositionSummary(
     output += `${topBorder}\n`;
     output += `│${renderRow(headers)}│\n`;
     output += `${midBorder}\n`;
-    for (const row of rows) {
+    for (const row of rowsForAgent) {
       output += `│${renderRow(values(row))}│\n`;
     }
     output += `${bottomBorder}\n`;
@@ -186,6 +154,111 @@ export function formatPositionSummary(
 
   output += "\n";
   return output;
+}
+
+export function buildPositionSnapshot(bundles: PositionBundle[]): PositionSnapshotAgent[] {
+  const rows = collectLatestPositions(bundles);
+  const grouped = new Map<string, PositionSnapshotAgent>();
+
+  for (const row of rows) {
+    if (!grouped.has(row.agent)) {
+      grouped.set(row.agent, { agent: row.agent, positions: [] });
+    }
+
+    const bucket = grouped.get(row.agent)!;
+    bucket.positions.push({
+      symbol: row.symbol,
+      side: row.side,
+      quantity: Math.abs(row.quantity),
+      leverage: row.leverage,
+      entryPrice: row.entryPrice ?? undefined,
+      currentPrice: row.currentPrice ?? undefined,
+      unrealizedPnl: row.unrealizedPnl ?? undefined,
+      profitTarget: row.profitTarget ?? undefined,
+      stopLoss: row.stopLoss ?? undefined
+    });
+  }
+
+  return Array.from(grouped.values()).map((entry) => ({
+    agent: entry.agent,
+    positions: entry.positions.sort((a, b) => a.symbol.localeCompare(b.symbol))
+  }));
+}
+
+function collectLatestPositions(bundles: PositionBundle[]): PositionRowRaw[] {
+  const latest = new Map<
+    string,
+    {
+      bundle: PositionBundle;
+      position: Position;
+      quantity: number;
+      timestamp: number;
+      marker?: number;
+    }
+  >();
+
+  for (const bundle of bundles) {
+    const position = extractPosition(bundle.raw);
+    if (!position) continue;
+
+    const quantityRaw =
+      typeof position.quantity === "number"
+        ? position.quantity
+        : Number.parseFloat(String(position.quantity ?? NaN));
+
+    if (!Number.isFinite(quantityRaw)) continue;
+    const holdQuantity = Math.abs(quantityRaw);
+    if (holdQuantity <= 1e-8) continue;
+
+    const key = `${bundle.normalized.agentId}::${bundle.normalized.symbol}`;
+    const timestamp = parseTimestamp(bundle.normalized.receivedAt);
+    const marker = Number.isFinite(bundle.normalized.signalMarker)
+      ? bundle.normalized.signalMarker
+      : undefined;
+
+    const existing = latest.get(key);
+    if (!existing) {
+      latest.set(key, { bundle, position, quantity: quantityRaw, timestamp, marker });
+      continue;
+    }
+
+    if (
+      timestamp > existing.timestamp ||
+      (timestamp === existing.timestamp &&
+        marker !== undefined &&
+        (existing.marker === undefined || marker > existing.marker))
+    ) {
+      latest.set(key, { bundle, position, quantity: quantityRaw, timestamp, marker });
+    }
+  }
+
+  const rows: PositionRowRaw[] = [];
+  for (const snapshot of latest.values()) {
+    const { bundle, position, quantity } = snapshot;
+    const leverage =
+      bundle.normalized.leverage ??
+      (typeof position.leverage === "number" ? position.leverage : undefined);
+
+    const entryPrice = position.entry_price ?? bundle.normalized.entryPrice;
+    const currentPrice = position.current_price ?? bundle.normalized.currentPrice;
+    const profitTarget = position.exit_plan?.profit_target ?? null;
+    const stopLoss = position.exit_plan?.stop_loss ?? null;
+
+    rows.push({
+      agent: bundle.normalized.agentId,
+      symbol: bundle.normalized.symbol,
+      quantity,
+      side: quantity >= 0 ? "LONG" : "SHORT",
+      leverage,
+      entryPrice,
+      currentPrice,
+      unrealizedPnl: position.unrealized_pnl ?? null,
+      profitTarget,
+      stopLoss
+    });
+  }
+
+  return rows;
 }
 
 function formatNumber(

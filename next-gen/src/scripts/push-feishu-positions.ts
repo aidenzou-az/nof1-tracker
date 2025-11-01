@@ -5,7 +5,7 @@ import crypto from "node:crypto";
 import { AgentAccount, Nof1Response } from "../types/nof1";
 import { fetchAgentAccounts } from "../services/signal-fetcher";
 import { buildBundlesFromAccounts } from "../services/signal-bundler";
-import { formatPositionSummary } from "../services/position-formatter";
+import { buildPositionSnapshot } from "../services/position-formatter";
 
 interface ScriptOptions {
   agents?: string[];
@@ -47,13 +47,17 @@ async function main(): Promise<void> {
   }
 
   const bundles = buildBundlesFromAccounts(accounts, options.source ?? "feishu", options.input);
-  const summary = formatPositionSummary(
-    bundles,
-    options.heading ?? `Agent Positions @ ${new Date().toISOString()}`
-  ).replace(/^\n+/, "");
+  const snapshot = buildPositionSnapshot(bundles);
+  const heading = options.heading ?? `Agent Positions @ ${new Date().toISOString()}`;
+  const payloadBody = {
+    heading,
+    generatedAt: new Date().toISOString(),
+    agents: snapshot
+  };
+  const payloadText = JSON.stringify(payloadBody, null, 2);
 
   if (options.dryRun || !webhookUrl || !secret) {
-    console.log(summary);
+    console.log(payloadText);
     return;
   }
 
@@ -66,7 +70,7 @@ async function main(): Promise<void> {
     sign: signature,
     msg_type: "text",
     content: {
-      text: summary.trimEnd()
+      text: payloadText
     }
   };
 
